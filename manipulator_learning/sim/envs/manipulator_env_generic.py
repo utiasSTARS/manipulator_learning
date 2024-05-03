@@ -44,6 +44,7 @@ class ManipulatorEnv(gym.Env):
                  render_opengl_gui=False,  # render the pybullet gui with opengl...raises error if egl also True.
                  force_pb_direct=False,  # force pybullet Direct connection..overriden to False if above is True
                  objs_no_rot_no_vel=(),  # object indices with rotation pos and all vel removed from state
+                 precalc_substeps=False,
                  ):
 
         if config_dict is None:
@@ -85,7 +86,7 @@ class ManipulatorEnv(gym.Env):
         self.success_causes_done = success_causes_done
         self.failure_causes_done = failure_causes_done
         self.real_t_per_ts = self.env._time_step * n_substeps
-        self._max_episode_steps = int(max_real_time / self.real_t_per_ts)
+        self._max_episode_steps = round(max_real_time / self.real_t_per_ts)
         self.n_substeps = n_substeps
         self.action_multiplier = action_multiplier
         self.grip_multiplier = grip_multiplier
@@ -97,7 +98,7 @@ class ManipulatorEnv(gym.Env):
         self._cube_rot_fix = False
 
         # prev pose info
-        self.gap_between_prev_pos = int(1 / self.env._time_step * gap_between_prev_pos / n_substeps)
+        self.gap_between_prev_pos = round(1 / self.env._time_step * gap_between_prev_pos / n_substeps)
         self.num_prev_pos=num_prev_pos
         self.prev_pos=None
 
@@ -157,6 +158,8 @@ class ManipulatorEnv(gym.Env):
                           int('obj_rot_vel' in state_data) * 3 * len(self.env.objs_in_state)
                 self.observation_space = spaces.Box(-np.inf, np.inf, (num_obs,), dtype=np.float32)
 
+        self._precalc_substeps = precalc_substeps
+
     def set_max_episode_steps(self, n):
         self._max_episode_steps = n
 
@@ -165,9 +168,11 @@ class ManipulatorEnv(gym.Env):
         self.np_random = self.env.np_random
         return ret_seed
 
-    def step(self, action):
+    def step(self, action, substep_render_func=None, substep_render_delay=1):
         action = self.action_multiplier * action
-        
+        if self._precalc_substeps:
+            action *= self.n_substeps
+
         # adjust action shape if coming from dof limited env
         # action should come in as (n,) shape array, where n is total number of valid dofs
         # if gripper in action, add one more to shape for gripper out, anything below 0 is open, anything above
@@ -197,9 +202,14 @@ class ManipulatorEnv(gym.Env):
         # now action is a 2 or 3 tuple, depending on if gripper in action, with first 2 elements trans and rot vel
         limit_reached = False
 
-        for i in range(self.n_substeps):
-            # obs_dict, reward, done, _ = self.env.step(action, self.pos_limits) # pos_limits in this argument is deprecated
-            obs_dict, reward, done, _ = self.env.step(action)
+        if self._precalc_substeps:
+            obs_dict, reward, done, _ = self.env.step(
+                action, get_obs=True, n_substeps=self.n_substeps,
+                substep_render_func=substep_render_func, substep_render_delay=substep_render_delay)
+        else:
+            for i in range(self.n_substeps):
+                # obs_dict, reward, done, _ = self.env.step(action)
+                obs_dict, reward, done, _ = self.env.step(action, get_obs=(i==self.n_substeps-1))  # only prepare observation on final step
         self.img_rendered = False
         self.human_img_rendered = False
 
@@ -484,19 +494,19 @@ class ManipulatorEnv(gym.Env):
     def _tk_esc_pressed(self, event):
         self.window.destroy()
 
-    def render(self, mode='human'):
-        if not self.img_rendered:  # ensures only one render per step
+    def render(self, mode='human', substep_render=False):
+        if not self.img_rendered or substep_render:  # ensures only one render per step
             if self._new_env_with_fixed_depth:
-                self.rgb, self.depth = self.env.render('workspace', depth_type='fixed')
+                self.rgb, self.depth = self.env.render('workspace', depth_type='fixed', substep_render=substep_render)
             else:
-                self.rgb, self.depth = self.env.render('workspace')
+                self.rgb, self.depth = self.env.render('workspace', substep_render=substep_render)
             self.rgb = self.rgb[:, :, :3]
             self.img_rendered = True
         if mode == 'human':
             # rerender if too small
-            if not self.human_img_rendered:
+            if not self.human_img_rendered or substep_render:
                 if self.image_width < 160:
-                    self.human_rgb, _ = self.env.render('human')
+                    self.human_rgb, _ = self.env.render('human', substep_render=substep_render)
                     self.human_rgb = self.human_rgb[:, :, :3]
                 else:
                     self.human_rgb = self.rgb
@@ -535,7 +545,7 @@ class ManipulatorEnv(gym.Env):
             return self.rgb, self.depth
 
         elif mode == 'rgb_and_true_depth_and_segment_mask':
-            return self.env.render('workspace', depth_type='true', segment_mask=True)
+            return self.env.render('workspace', depth_type='true', segment_mask=True, substep_render=substep_render)
 
     def reset(self, mb_base_angle=None, reset_dict=None):
         self.img_rendered = False

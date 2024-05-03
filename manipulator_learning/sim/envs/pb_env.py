@@ -14,11 +14,11 @@ import manipulator_learning.sim.utils.general as sim_utils
 from manipulator_learning.sim.utils.general import TransformMat, invert_transform, q_convert, convert_quat_tf_to_pb, \
     trans_quat_to_mat, convert_quat_pb_to_tf
 from manipulator_learning.sim.robots.cameras import EyeInHandCam, WorkspaceCam
-from manipulator_learning.sim.robots.manipulator_wrapper import ManipulatorWrapper
+from manipulator_learning.sim.robots.manipulator_wrapper import ManipulatorWrapper, timer
 
 
 SHOW_PB_FRAME_MARKERS = False
-
+DEBUG_GUI_ON = False
 
 class PBEnv(gym.Env):
     """ Create a pybullet env. Although this inherits gym.Env, it shouldn't be used on its own, but rather as
@@ -108,6 +108,9 @@ class PBEnv(gym.Env):
             # insertion (deprecated)
             rod_random_lim=None,  # deprecated, for old insertion tasks only
             init_rod_pos=None,  # deprecated, for old insertion tasks only
+
+            # debug time
+            debug_time = False
     ):
         # gym
         self.np_random = None
@@ -208,6 +211,13 @@ class PBEnv(gym.Env):
 
         # start of env generation
         # start pybullet
+
+        # override for forcing gui on
+        if DEBUG_GUI_ON:
+            force_pb_direct = False
+            self._render_opengl_gui = True
+            use_egl = False
+
         if force_pb_direct:  # useful for multiprocessing or similar
             self._pb_client = BulletClient(connection_mode=pybullet.DIRECT)
         else:
@@ -284,7 +294,7 @@ class PBEnv(gym.Env):
             three_pts_ee_distance=pose_3_pts_dist, gripper_default_close=gripper_default_close,
             max_gripper_vel=max_gripper_vel, gripper_force=gripper_force, pos_limits=pos_limits,
             pos_limits_frame=pos_limits_frame, force_torque_gravity_sub=force_torque_gravity_sub,
-            pos_ctrl_max_arm_force=pos_ctrl_max_arm_force
+            pos_ctrl_max_arm_force=pos_ctrl_max_arm_force, debug_time=debug_time
         )
         self._time_step = time_step  # also sets it in client and manipulator through setter
 
@@ -347,10 +357,25 @@ class PBEnv(gym.Env):
                                                      renderer=renderer, render_shadows=render_shadows,
                                                      light_direction=light_direction)
 
+        width = 500; height = 500
+        self.panda_play_alt_closer = WorkspaceCam(self._pb_client, width, height, width / height,
+                                                     [1.15, -0.1, 0.82], [-0.01, -1.13682302, -0.43634726],
+                                                     renderer=renderer, render_shadows=render_shadows,
+                                                     light_direction=light_direction)
+
+        width = 500; height = 500
+        self.panda_play_higher_closer = WorkspaceCam(self._pb_client, width, height, width / height,
+                                                     [1.2, -0.05, 0.92], [0.16873906, -0.8, -0.62046253],
+                                                     renderer=renderer, render_shadows=render_shadows,
+                                                     light_direction=light_direction)
+
+
         if SHOW_PB_FRAME_MARKERS:
             add_pb_frame_marker(self._pb_client, self.gripper.body_id, self.gripper.manipulator._arm_ind[-1])
             add_pb_frame_marker(self._pb_client, self.gripper.body_id, self.gripper.manipulator._tool_link_ind)
             add_pb_frame_marker(self._pb_client, self.gripper.body_id, self.gripper.ref_frame_indices['b'])
+
+        self._debug_time = debug_time
 
     @property
     def _time_step(self):
@@ -367,12 +392,16 @@ class PBEnv(gym.Env):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-    def step(self, action, pos_limits=None):
+    def step(self, action, pos_limits=None, get_obs=True, n_substeps=1,
+             substep_render_func=None, substep_render_delay=1):
         """ Take a step in the environment. This does not actually give a camera/depth image, for that, use render.
 
         pos_limits here is deprecated. pos_limits should be set when this class is instantiated."""
 
-        self.gripper.step(action, pos_limits=pos_limits)
+        step_tic = timer()
+        self.gripper.step(action, pos_limits=pos_limits, n_substeps=n_substeps,
+                          substep_render_func=substep_render_func, substep_render_delay=substep_render_delay)
+        if self._debug_time: print(f"step time: {timer() - step_tic}")
 
         # reward function depends on task/environment setup -- deprecated, handled by top level classes now
         if self.task == 'grasp_and_place':
@@ -404,31 +433,37 @@ class PBEnv(gym.Env):
             reward = 0
 
         # prepare observations dict after step in env is taken
-        obs_dict = self._prepare_obs_dict_new()
+        if get_obs:
+            obs_tic = timer()
+            obs_dict = self._prepare_obs_dict_new(n_substeps)
+            if self._debug_time: print(f"obs dict time: {timer() - obs_tic}")
+
+            if not self.first_gripper_close and obs_dict['command']['grip']:
+                self.first_gripper_close = True
+
+            if self.first_gripper_close and not self.last_gripper_close and not obs_dict['command']['grip']:
+                self.last_gripper_close = True
+        else:
+            obs_dict = {}
+
         self.initial_move_made = True
-
-        if not self.first_gripper_close and obs_dict['command']['grip']:
-            self.first_gripper_close = True
-
-        if self.first_gripper_close and not self.last_gripper_close and not obs_dict['command']['grip']:
-            self.last_gripper_close = True
 
         return obs_dict, reward, False, {}
 
-    def _prepare_obs_dict_new(self):
+    def _prepare_obs_dict_new(self, n_substeps=1):
         obs_dict = {'actual': self.gripper.receive_observation(ref_frame_pose=self.poses_ref_frame,
                                                                ref_frame_vel=self.vel_ref_frame),
                     'command': self.gripper.receive_action(),
-                    'block_poses': self._prepare_block_poses_dict()}
+                    'block_poses': self._prepare_block_poses_dict(n_substeps)}
         return obs_dict
 
-    def _prepare_block_poses_dict(self):
+    def _prepare_block_poses_dict(self, n_substeps=1):
         block_dict = {'pos': [], 'orient': [], 'vel': [], 'acc': []}
 
         if self.rel_pos_in_state is None:
-            obj_poses, obj_vels, obj_accs = self._get_block_poses()
+            obj_poses, obj_vels, obj_accs = self._get_block_poses(n_substeps)
         else:
-            obj_poses, obj_vels, obj_accs, obj_rel_poss = self._get_block_poses()
+            obj_poses, obj_vels, obj_accs, obj_rel_poss = self._get_block_poses(n_substeps)
             block_dict['rel_pos'] = []
             for rel_pos in obj_rel_poss:
                 block_dict['rel_pos'].append(rel_pos)
@@ -461,7 +496,7 @@ class PBEnv(gym.Env):
 
         return block_dict
 
-    def _get_block_poses(self):
+    def _get_block_poses(self, n_substeps=1):
         """ Return the positions of the blocks in the environment as a list """
         poses = []
         vels = []
@@ -499,7 +534,7 @@ class PBEnv(gym.Env):
             if self.gripper._step_counter == 0:
                 accs.append(np.zeros(6))
             else:
-                accs.append((np.array(vel) - self._prev_obj_vels[b_index]) / self._time_step)
+                accs.append((np.array(vel) - self._prev_obj_vels[b_index]) / (self._time_step * n_substeps))
             self._prev_obj_vels[b_index] = vel
 
             if self.rel_pos_in_state is not None:
@@ -1104,7 +1139,7 @@ class PBEnv(gym.Env):
             else:
                 pbc.changeVisualShape(body_id, link_id, shapeIndex=shape_id, textureUniqueId=text_id)
 
-    def render(self, mode='human', depth_type='original', segment_mask=False):
+    def render(self, mode='human', depth_type='original', segment_mask=False, substep_render=False):
         # assert mode in PBEnv.RENDER_MODES, f"{mode} is not a valid render mode, must be one of {PBEnv.RENDER_MODES}"
 
         # cam pose override for choosing a new cam pose, comment out during regular operation ---------------
@@ -1138,13 +1173,13 @@ class PBEnv(gym.Env):
         #             self.cam_pose_override[1][2] += speed
         #         elif k == ord('h'):
         #             self.cam_pose_override[1][2] -= speed
-        #
+
         # new_cam_pose = np.eye(4)
         # new_cam_pose[:3, 3] = self.cam_pose_override[0]
         # new_cam_pose[:3, :3] = tf3d.euler.euler2mat(*self.cam_pose_override[1], 'sxyz')
         # self.workspace_cam.frame_rel_tf = new_cam_pose
         # self.workspace_cam_high_res.frame_rel_tf = new_cam_pose
-        #
+
         # target_tf = np.eye(4)
         # target_tf[:3, 3] = np.dot(np.array(self.workspace_cam.forward_axis), self.workspace_cam.focus_dist)
         # self.workspace_cam.frame_rel_target_tf = np.dot(self.workspace_cam.frame_rel_tf, target_tf)
@@ -1153,14 +1188,21 @@ class PBEnv(gym.Env):
         # print(self.cam_pose_override)
 
         # NOTE! for adding a new camera, print out the cam_pose and the cam_target_pose from EyeInHandCam.get_img,
-        # and use those as the eye and target for a new camera
+        # and use those as the eye and target for a new camera.. YOU MUST UNCOMMENT THESE IN EyeInHandCam.get_img,
+        # which is in sim/robots/cameras.py
+        # i'm so sorry for how complicated and dumb this is :(
 
         # end of cam pose override--------------------------------------------------------------------------
 
-        cur_pose = self.gripper.manipulator.get_link_pose(self.gripper.manipulator._tool_link_ind)
-        cur_pose = [cur_pose[:3], cur_pose[3:]]
-        cur_base_pose = self.gripper.manipulator.get_link_pose(0)
-        cur_base_pose = [cur_base_pose[:3], cur_base_pose[3:]]
+        if not hasattr(self, 'rend_cur_pose') or not substep_render:
+            # don't update these on substep renders because it changes how the environment runs, even though it shouldn't
+            self.rend_cur_pose = self.gripper.manipulator.get_link_pose(self.gripper.manipulator._tool_link_ind)
+            self.rend_cur_pose = [self.rend_cur_pose[:3], self.rend_cur_pose[3:]]
+            self.rend_cur_base_pose = self.gripper.manipulator.get_link_pose(0)
+            self.rend_cur_base_pose = [self.rend_cur_base_pose[:3], self.rend_cur_base_pose[3:]]
+
+        cur_pose = self.rend_cur_pose
+        cur_base_pose = self.rend_cur_base_pose
 
         if mode == 'human':
             cur_base_pose_mat = trans_quat_to_mat(*cur_base_pose)

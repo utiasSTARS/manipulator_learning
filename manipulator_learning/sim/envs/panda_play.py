@@ -63,6 +63,8 @@ class PandaPlayGeneric(ManipulatorEnv):
                  force_pb_direct=False,
                  sparse_cond_time=0.5,
                  pos_ctrl_max_arm_force=50,
+                 force_cube_rot_fix=False,  # ensures that only cube rotations about z are considered
+                 precalc_substeps=False,
                  **kwargs):
 
         config_dict = copy.deepcopy(DEF_CONFIG)
@@ -94,7 +96,8 @@ class PandaPlayGeneric(ManipulatorEnv):
                          control_frame='b', action_multiplier=action_multiplier,
                          valid_t_dofs=valid_t_dofs, valid_r_dofs=valid_r_dofs,
                          new_env_with_fixed_depth=True, config_dict=config_dict,
-                         generate_spaces=True, vel_ref_frame='b', force_pb_direct=force_pb_direct, **kwargs)
+                         generate_spaces=True, vel_ref_frame='b', force_pb_direct=force_pb_direct,
+                         precalc_substeps=precalc_substeps, **kwargs)
         self.sparse_cond_time = sparse_cond_time   # time to "hold" conditions for triggering sparse reward
         self.sparse_cond_start_time = None
         self.limits_cause_failure = limits_cause_failure
@@ -114,7 +117,8 @@ class PandaPlayGeneric(ManipulatorEnv):
             self.task_suffix = [int(suf_char) for suf_char in list(main_task[und_loc + 1:])]
 
             # for stack, we're hardcoding that _0 or _1 indicates _01 or _10 for now.
-            if self.main_task == 'stack' or self.main_task == 'unstack_stack' or self.main_task == 'unstack_stack_env_only':
+            # if self.main_task == 'stack' or self.main_task == 'unstack_stack' or self.main_task == 'unstack_stack_env_only':
+            if 'stack' in self.main_task:
                 if self.task_suffix == [0]:
                     self.task_suffix = [0, 1]
                 elif self.task_suffix == [1]:
@@ -124,9 +128,13 @@ class PandaPlayGeneric(ManipulatorEnv):
             self.task_suffix = None
 
         # initial setting for unstack_stack -- can be modified for eval
-        if self.main_task in ('unstack_stack', 'unstack_move_obj', 'unstack_lift', 'unstack_stack_env_only') and \
-                hasattr(self.env, 'green_on_blue'):
+        # if self.main_task in ('unstack_stack', 'unstack_move_obj', 'unstack_lift', 'unstack_stack_env_only') and \
+            # hasattr(self.env, 'green_on_blue'):
+        if 'unstack' in self.main_task and hasattr(self.env, 'green_on_blue'):
             self.env.green_on_blue = True
+            self._cube_rot_fix = True
+
+        if force_cube_rot_fix:
             self._cube_rot_fix = True
 
     def reset_episode_success_data(self):
@@ -184,8 +192,12 @@ class PandaPlayGeneric(ManipulatorEnv):
                     assert task_suffix in [0, 1], "get_task_successes only implemented for 0 and 1 suffixes for now"
                     main_task = task[:und_loc]
                 except ValueError:  # then it's a task that has an underscore but no integer on the end
-                    task_suffix = None
+                    task_suffix = 0
                     main_task = task
+            else:
+                # assume that it's task_0
+                main_task = task
+                task_suffix = 0
 
             if main_task in ("pure_open", "pure_close"):
                 if task == 'pure_open':
@@ -209,17 +221,18 @@ class PandaPlayGeneric(ManipulatorEnv):
                 # opposite block to task_suffix
                 suc_cur_timestep = bool(task_obj_poss[1 - task_suffix, 2] <= table_height + .001)
 
-            elif main_task == 'stack' or main_task == 'stack_pp_env' or main_task == 'unstack_stack' or main_task == 'unstack_stack_env_only':
+            elif main_task in ('stack', 'stack_pp_env', 'unstack_stack', 'unstack_stack_env_only', 'stack_no_move',
+                               'unstack_stack_no_move', 'unstack_stack_env_only_no_move'):
                 if task_suffix == 1:
                     suc_cur_timestep = stack_rew.stack_sparse(pbc, task_obj_pb_ids[::-1], arm_pb_id, table_pb_id)
                 else:
                     suc_cur_timestep = stack_rew.stack_sparse(pbc, task_obj_pb_ids, arm_pb_id, table_pb_id)
 
-            elif main_task == 'insert' or main_task == 'bring' or main_task == 'pick_and_place':
-                if main_task == 'insert':
+            elif main_task in ('insert', 'insert_no_bring', 'insert_no_bring_no_move', 'bring_no_move', 'bring', 'pick_and_place'):
+                if 'insert' in main_task:
                     cur_target_obj_poss = copy.deepcopy(self._tray_insert_poss_world)
                     thresh = .0025
-                elif main_task == 'bring':
+                elif 'bring' in main_task:
                     cur_target_obj_poss = copy.deepcopy(target_obj_poss)
                     thresh = .03
                 elif main_task == 'pick_and_place':
@@ -231,7 +244,7 @@ class PandaPlayGeneric(ManipulatorEnv):
                     cur_task_obj_poss = task_obj_poss[task_suffix]
                     cur_task_obj_pb_ids = np.atleast_1d(task_obj_pb_ids[task_suffix])
 
-                if main_task == 'insert' or main_task == 'bring':
+                if 'insert' in main_task or 'bring' in main_task:
                     contacts = bring_rew.bring_contact_bonus_list(pbc, cur_task_obj_pb_ids, arm_pb_id, table_pb_id)
                 else:
                     contacts = None
@@ -315,13 +328,14 @@ class PandaPlayGeneric(ManipulatorEnv):
         table_height, ee_pos, task_obj_indices, task_obj_poss, target_obj_poss, pbc, task_obj_pb_ids, arm_pb_id, table_pb_id = \
             self._get_reward_state_info()
 
-        if self.main_task in ('stack', 'stack_open_close', 'stack_pp_env', 'unstack_stack', 'unstack_stack_env_only'):
+        if self.main_task in ('stack', 'stack_open_close', 'stack_pp_env', 'unstack_stack', 'unstack_stack_env_only',
+                              'stack_no_move', 'unstack_stack_no_move', 'unstack_stack_env_only_no_move'):
             # unstack_stack should include bonus for green being moved off, but not implemented since currently unused
             obj_height = .04
             all_suc = stack_rew.stack_sparse(pbc, task_obj_pb_ids, arm_pb_id, table_pb_id)
             if dense_reward:
                 reward = stack_rew.stack_dense(all_suc, task_obj_poss, obj_height, ee_pos)
-        elif self.main_task == 'insert':
+        elif self.main_task in ('insert', 'insert_no_bring', 'insert_no_bring_no_move'):
             # hard-coded success positions given particular tray urdf
             assert len(task_obj_indices) <= 2, "Tray is only set up for 1 or 2 insertions"
             assert hasattr(self, "_tray_insert_poss_world"), "Need tray insert positions to be defined as object attribute."
@@ -335,7 +349,7 @@ class PandaPlayGeneric(ManipulatorEnv):
             if dense_reward:
                 reward = bring_rew.bring_dense_multiple(task_obj_poss, ee_pos, target_obj_poss,
                                                         insert_bonuss=all_suc_list)
-        elif self.main_task == 'bring' or self.main_task == 'bring_and_remove':
+        elif self.main_task in ('bring', 'bring_and_remove', 'bring_no_move'):
             thresh = .03
             correct_contact = bring_rew.bring_contact_bonus(pbc, task_obj_pb_ids, arm_pb_id, table_pb_id)
             all_suc = bring_rew.bring_sparse_multiple(task_obj_poss, target_obj_poss, thresh) and correct_contact
@@ -414,17 +428,20 @@ class PandaPlayInsertTrayXYZState(PandaPlayGeneric):
     #   - force_torque:    53:59
     # n_substeps of 5 plus action multiplier of .002 means action mag of 1.0 moves desired position 2mm*5 = 1cm
     def __init__(self, max_real_time=18, n_substeps=5, dense_reward=True, action_multiplier=0.002,
-                 main_task='insert', force_pb_direct=True, **kwargs):
+                 main_task='insert', force_pb_direct=True, precalc_substeps=False,
+                 state_data=('pos', 'vel', 'grip_pos', 'prev_grip_pos', 'obj_pos', 'obj_rot', 'obj_vel',
+                                     'obj_rot_vel', 'force_torque'),
+                 **kwargs):
                  # main_task='unstack_stack_0', force_pb_direct=True, **kwargs):
+
         super().__init__('None', False, dense_reward, max_real_time=max_real_time, n_substeps=n_substeps,
                          action_multiplier=action_multiplier,
-                         state_data=('pos', 'vel', 'grip_pos', 'prev_grip_pos', 'obj_pos', 'obj_rot', 'obj_vel',
-                                     'obj_rot_vel', 'force_torque'),
+                         state_data=state_data,
                          tray_type='2_cube_insert',
                          obj_init_pos=((0, 0, 0), (0, 0, 0), (0.075, 0.0, -.055), (-0.075, 0.0, -.055)), # for insert tray
                          valid_t_dofs=(1, 1, 1), valid_r_dofs=(0, 0, 0), control_method='dp',
                          pos_limits=((.85, -.35, .665), (1.15, -0.05, 0.8)),  # for insert tray
-                         main_task=main_task, force_pb_direct=force_pb_direct,
+                         main_task=main_task, force_pb_direct=force_pb_direct, precalc_substeps=precalc_substeps,
                          **kwargs)
 
         # hardcode the insertion locations, since they correspond to the urdf itself

@@ -1,4 +1,5 @@
 import copy
+import timeit
 from liegroups import SO3, SE3
 import transforms3d as tf3d
 from transforms3d.quaternions import mat2quat
@@ -15,6 +16,7 @@ POS = range(0, 3)
 ROT = range(3, 6)
 KI = .01
 
+def timer(): return timeit.default_timer()
 
 # originally from https://github.com/utiasSTARS/pyb-manipulator/tree/manipulator-learning
 
@@ -59,7 +61,8 @@ class Manipulator:
                  force_gravity_sub=0,
                  max_gripper_vel=0.8,
                  gripper_force=10,
-                 pos_ctrl_max_arm_force=None):
+                 pos_ctrl_max_arm_force=None,
+                 debug_time=False):
         self._pb_client = pb_client
         self.self_collision = self_collision
         self.urdf_path = urdf_path
@@ -143,6 +146,8 @@ class Manipulator:
             T_world_tool = self.pb_pos_orient_to_mat(t_pos, t_orient)
             self.T_ft_to_tool = np.linalg.inv(T_world_ft).dot(T_world_tool)
             self.T_tool_to_ft = np.linalg.inv(self.T_ft_to_tool)
+
+        self._debug_time = debug_time
 
     def _reset_all_flags(self):
         """
@@ -431,22 +436,34 @@ class Manipulator:
 
     def set_frame_pose_goal(self, index, t_pos, t_rot, ref_frame_index=None, max_joint_velocity=None):
         ''' set a pose goal for an arbitrary frame'''
+        ref_tic = timer()
         if ref_frame_index is not None:
+            pose_tic = timer()
             ref_frame_pose = self.get_link_pose(link_index=ref_frame_index)
+            if self._debug_time: print(f"get link pose time: {timer() - pose_tic}")
             T_world_to_ref = np.eye(4)
             T_world_to_ref[:3, 3] = ref_frame_pose[:3]
+            so3_from_quat_tic = timer()
             T_world_to_ref[:3, :3] = SO3.from_quaternion(ref_frame_pose[3:], 'xyzw').as_matrix()
             T_ref_to_des = np.eye(4)
             T_ref_to_des[:3, 3] = t_pos
             T_ref_to_des[:3, :3] = SO3.from_quaternion(t_rot, 'xyzw').as_matrix()
+            if self._debug_time: print(f"so3_from_quat time: {timer() - so3_from_quat_tic}")
+            dot_tic = timer()
             T_world_to_des = np.dot(T_world_to_ref, T_ref_to_des)
+            if self._debug_time: print(f"dot time: {timer() - dot_tic}")
             t_pos = T_world_to_des[:3, 3]
+            m2q_tic = timer()
             t_rot_wxyz = mat2quat(T_world_to_des[:3, :3])
+            if self._debug_time: print(f"m2q time: {timer() - m2q_tic}")
             t_rot = np.array([*t_rot_wxyz[1:4], t_rot_wxyz[0]])
+        if self._debug_time: print(f"ref adjust time: {timer() - ref_tic}")
 
+        inv_kin_tic = timer()
         result = self._pb_client.calculateInverseKinematics(self._arm[0], index, targetPosition=t_pos.tolist(),
                                               targetOrientation=t_rot.tolist(), maxNumIterations=200,
                                               residualThreshold=0.002)
+        if self._debug_time: print(f"inv kin time: {timer() - inv_kin_tic}")
 
         help = np.array(result)
         if max_joint_velocity is not None:

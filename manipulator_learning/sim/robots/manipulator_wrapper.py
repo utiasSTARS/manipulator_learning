@@ -7,7 +7,7 @@ import copy
 
 import transforms3d as tf3d
 
-from manipulator_learning.sim.robots.manipulator import Manipulator, pose_error
+from manipulator_learning.sim.robots.manipulator import Manipulator, pose_error, timer
 from manipulator_learning.sim.utils.general import convert_quat_pb_to_tf, convert_quat_tf_to_pb, convert_pose_to_3_pts
 import manipulator_learning.sim.utils.general as sim_utils
 
@@ -33,7 +33,8 @@ class ManipulatorWrapper:
                  pos_limits_frame='w',
                  force_torque_gravity_sub=0,
                  pos_ctrl_max_arm_force=None,
-                 finger_constraint=True):
+                 finger_constraint=True,
+                 debug_time=False):
 
         self.rc = robot_config
         urdf_path = self.rc['urdf_root']
@@ -58,7 +59,7 @@ class ManipulatorWrapper:
                                        base_pos, base_rot, get_velocities=True, self_collision=self_collision,
                                        max_gripper_vel=max_gripper_vel, gripper_force=gripper_force,
                                        force_gravity_sub=force_torque_gravity_sub,
-                                       pos_ctrl_max_arm_force=pos_ctrl_max_arm_force)
+                                       pos_ctrl_max_arm_force=pos_ctrl_max_arm_force, debug_time=debug_time)
 
         self._pb_client = pb_client
         self._timestep = timestep
@@ -142,14 +143,32 @@ class ManipulatorWrapper:
 
         self.pos_limits = pos_limits
 
-    def step(self, action, pos_limits=None):
+        self._debug_time = debug_time
+
+        # make rendered substeps accessible in a slightly hacky way
+        self._internal_substep_render_func = None
+        self._rendered_substeps = []
+
+    def step(self, action, pos_limits=None, n_substeps=1, substep_render_func=None, substep_render_delay=1):
         """
         Apply action and step simulation forward. Apply pos_limits if not pre-defined in this class.
         """
         if pos_limits is not None and self.pos_limits is None:  # if self.pos_limits exists, handled in apply
             action[:2], limit_reached = self.limit_action(action[:2], pos_limits, 5, 5)
+        app_tic = timer()
         self.apply_action(action[0], action[1], action[2], self.action_ref_frame)
-        self._pb_client.stepSimulation()
+        if self._debug_time: print(f"app time: {timer() - app_tic}")
+        pb_tic = timer()
+        if self._internal_substep_render_func is not None:
+            self._rendered_substeps = []
+        for substep in range(n_substeps):
+            self._pb_client.stepSimulation()
+            if self._internal_substep_render_func is not None and substep % substep_render_delay == 0:
+                img, _ = self._internal_substep_render_func()
+                self._rendered_substeps.append(img)
+            elif substep_render_func is not None and substep % substep_render_delay == 0:
+                substep_render_func()
+        if self._debug_time: print(f"pb step time: {timer() - pb_tic}")
         self._step_counter += 1
 
     def apply_action(self, t_command, r_command, g_command, ref_frame):
@@ -184,20 +203,31 @@ class ManipulatorWrapper:
             # cur_pose = self.manipulator.get_link_pose(tool_ind, ref_ind)  # feedback, but doesn't work as well
             cur_pose = copy.deepcopy(self.dp_desired_pose)  # des pose
 
-            # to force non-valid rot axes to not be modified, set cur pose in those axes to match reset pose
-            cur_pose_eul = tf3d.euler.quat2euler(sim_utils.q_convert(cur_pose[3:], 'xyzw', 'wxyz'), 'sxyz')
-            fixed_cur_pose_eul = np.array(cur_pose_eul)
-            invalid_r = (1 - self.valid_r_dof).astype(bool)
-            fixed_cur_pose_eul[invalid_r] = self.init_gripper_rot_eul[invalid_r]
-            cur_pose[3:] = sim_utils.q_convert(tf3d.euler.euler2quat(*fixed_cur_pose_eul, axes='sxyz'), 'wxyz', 'xyzw')
+            valid_ax_tic = timer()
 
-            # treat input rot command as ax ang, fine for relatively small delta commands
-            cur_pose_T = sim_utils.trans_quat_to_mat(cur_pose[:3], cur_pose[3:])
             delta_T = np.eye(4)
-            ang = np.linalg.norm(r_command)
-            ax = r_command / (ang + 1e-8)
-            delta_T[:3, :3] = tf3d.axangles.axangle2mat(ax, ang, is_normalized=True)
             delta_T[:3, 3] = t_command
+
+            # if no rotational axes are valid, do no rotation calcs
+            if np.all(self.valid_r_dof == np.array([0, 0, 0])):
+                cur_pose[3:] = self.init_gripper_pose[1]
+
+            else:
+                # to force non-valid rot axes to not be modified, set cur pose in those axes to match reset pose
+                cur_pose_eul = tf3d.euler.quat2euler(sim_utils.q_convert(cur_pose[3:], 'xyzw', 'wxyz'), 'sxyz')
+                fixed_cur_pose_eul = np.array(cur_pose_eul)
+                invalid_r = (1 - self.valid_r_dof).astype(bool)
+                fixed_cur_pose_eul[invalid_r] = self.init_gripper_rot_eul[invalid_r]
+                cur_pose[3:] = sim_utils.q_convert(tf3d.euler.euler2quat(*fixed_cur_pose_eul, axes='sxyz'), 'wxyz', 'xyzw')
+
+                # treat input rot command as ax ang, fine for relatively small delta commands
+                ang = np.linalg.norm(r_command)
+                ax = r_command / (ang + 1e-8)
+                delta_T[:3, :3] = tf3d.axangles.axangle2mat(ax, ang, is_normalized=True)
+
+            cur_pose_T = sim_utils.trans_quat_to_mat(cur_pose[:3], cur_pose[3:])
+
+            if self._debug_time: print(f"valid ax time: {timer() - valid_ax_tic}")
 
             # to give commands in desired frame, need to have pose with pos given by tool frame, but orientation
             # given by desired ref frame, and transform from that -- only applies if ref frame is not tool frame
@@ -211,8 +241,11 @@ class ManipulatorWrapper:
                 delta_ref_pose_T[:3, :3] = sim_utils.trans_quat_to_mat(ref_pos_quat[:3], ref_pos_quat[3:])[:3, :3]
                 delta_ref_pose_T[:3, 3] = cur_pose_T[:3, 3]
                 new_pos = delta_ref_pose_T.dot(delta_T)[:3, 3]
-                new_q = sim_utils.q_convert(tf3d.quaternions.mat2quat(
-                    delta_T[:3, :3].dot(cur_pose_T[:3, :3])), 'wxyz', 'xyzw')
+                if np.all(self.valid_r_dof == np.array([0, 0, 0])):
+                    new_q = self.init_gripper_pose[1]
+                else:
+                    new_q = sim_utils.q_convert(tf3d.quaternions.mat2quat(
+                        delta_T[:3, :3].dot(cur_pose_T[:3, :3])), 'wxyz', 'xyzw')
 
             # enforce instance defined pos limits
             if self.pos_limits is not None:
@@ -221,7 +254,10 @@ class ManipulatorWrapper:
                 new_pos = np.clip(new_pos, self.pos_limits[0], self.pos_limits[1])
 
             self.dp_desired_pose = np.array([*new_pos, *new_q])
+
+            set_goal_tic = timer()
             self.manipulator.set_frame_pose_goal(self.manipulator._tool_link_ind, new_pos, new_q, ref_ind, 3.334)
+            if self._debug_time: print(f"Set frame pose goal time: {timer() - set_goal_tic}")
 
         elif self.manipulator._control_method == 'p':
             t_command = np.array(t_command)
@@ -366,6 +402,7 @@ class ManipulatorWrapper:
                                       "got %s" % (str(self.manipulator._control_method)))
 
         # open/close the gripper
+        grip_tic = timer()
         if self.gripper_control_method == 'dp':
             cur_pos = np.array(self.manipulator.jnt_pos[-self.manipulator._num_jnt_gripper:])
             cur_pos_match = np.ones_like(cur_pos) * np.min(cur_pos)  # to ensure fingers don't get off center
@@ -391,8 +428,11 @@ class ManipulatorWrapper:
                     self.manipulator.close_gripper()
                 else:
                     self.manipulator.open_gripper()
+        if self._debug_time: print(f"grip time: {timer() - grip_tic}")
 
+        up_tic = timer()
         self.manipulator.update()
+        if self._debug_time: print(f"Man up time: {timer() - up_tic}")
 
     def limit_action(self, action, pos_limits, t_vel_limit, r_vel_limit):
         # Ways to limit action (with positional, velocity, rotational, etc. limits)
