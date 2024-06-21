@@ -9,7 +9,7 @@ setup(
     license='MIT',
     packages=find_packages(),
     install_requires=['pybullet',
-                      'numpy',
+                      'numpy<2.0',
                       'liegroups @ git+ssh://git@github.com/utiasSTARS/liegroups@master#egg=liegroups',
                       'gym',
                       'transforms3d',
